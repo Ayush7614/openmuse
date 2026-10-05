@@ -1047,6 +1047,7 @@ export class AgentService {
         owner,
         monitor.url,
         typeof task.state.sessionId === "string" ? task.state.sessionId : undefined,
+        ctx.signal,
       );
     }
     const text = observation.text.replace(/\s+/g, " ").trim();
