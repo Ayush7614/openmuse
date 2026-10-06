@@ -656,11 +656,16 @@ export class AgentService {
       if (idea?.status !== "accepted") return idea;
     }
     if (idea.taskId && (await this.db.get(owner, "tasks", idea.taskId))) return idea;
-    const goal = await this.createGoal(
-      owner,
-      { title: idea.title, description: idea.reason },
-      hash(`idea-goal:${id}`),
-    );
+    const goalId =
+      typeof idea.input.goalId === "string"
+        ? idea.input.goalId
+        : (
+            await this.createGoal(
+              owner,
+              { title: idea.title, description: idea.reason },
+              hash(`idea-goal:${id}`),
+            )
+          ).id;
     const task = await this.createTask(
       owner,
       {
@@ -668,7 +673,7 @@ export class AgentService {
         prompt: idea.prompt,
         kind: idea.kind,
         input: idea.input,
-        goalId: goal.id,
+        goalId,
       },
       `idea:${id}`,
     );
