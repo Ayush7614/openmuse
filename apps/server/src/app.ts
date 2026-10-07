@@ -24,7 +24,8 @@ import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
-import { rateLimit } from "./rate-limit.ts";
+import { createRateLimitStore, rateLimit, resolveRequestKey } from "./rate-limit.ts";
+import { baseSecurityHeaders, contentSecurityPolicy, securityHeaders } from "./security-headers.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -51,12 +52,12 @@ export async function createApp(
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
+  // Hardening first so rejected requests (origin gate, rate limits, validation)
+  // carry the same headers as successful ones.
+  app.use("*", securityHeaders(config));
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
     if (origin && !origins.has(origin)) return c.json({ error: "Origin is not allowed" }, 403);
-    c.header("X-Content-Type-Options", "nosniff");
-    c.header("Referrer-Policy", "no-referrer");
-    c.header("Cache-Control", "no-store");
     await next();
   });
   app.use(
@@ -103,14 +104,28 @@ export async function createApp(
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
     }),
   );
-  let loginWindow = 0,
-    loginAttempts = 0;
-  app.post("/api/session", async (c) => {
-    if (Date.now() - loginWindow > 60000) {
-      loginWindow = Date.now();
-      loginAttempts = 0;
+  app.get("/api/ready", async (c) => {
+    // Load balancers cannot authenticate, so readiness stays open like health —
+    // but unlike health it actually probes the store, so a pod whose database
+    // is unreachable stops receiving traffic instead of serving 500s.
+    try {
+      await db.ping();
+      return c.json({ ok: true, mode: config.mode, database: "up" });
+    } catch {
+      return c.json({ ok: false, mode: config.mode, database: "down" }, 503);
     }
-    if (++loginAttempts > 30)
+  });
+  // Sign-in attempts are cheap for an attacker (one JSON body) and expensive to
+  // get wrong, so each client gets its own small bucket. The previous limiter
+  // was a single process-global 30/minute counter shared by every address,
+  // which meant one hostile client could lock every legitimate user out.
+  const signInAttempts = createRateLimitStore({
+    windowMs: 60_000,
+    maxRequests: 10,
+    maxEntries: 5_000,
+  });
+  app.post("/api/session", async (c) => {
+    if (!signInAttempts.take(resolveRequestKey(c, Boolean(config.trustProxy)), Date.now()))
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
     const session = await auth.session(body.accessKey);
@@ -319,10 +334,8 @@ export async function createApp(
   });
   app.get("/api/browsers/:id/console", async (c) => {
     await browser.get(c.get("owner"), c.req.param("id"));
-    c.header(
-      "Content-Security-Policy",
-      "default-src 'self'; img-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
-    );
+    // Content-Security-Policy for this page comes from the security-headers
+    // middleware, which preserves these allowances and adds framing protection.
     return c.html(browser.console(c.get("owner"), c.req.param("id")));
   });
   app.post("/api/browsers/:id/console", async (c) => {
@@ -345,7 +358,17 @@ export async function createApp(
         },
       }),
     );
-    return new Response(body, { status: response.status, headers: response.headers });
+    // A returned Response bypasses context headers, so apply the edge policy
+    // explicitly instead of inheriting whatever the runtime happened to set.
+    const headers = new Headers(response.headers);
+    for (const [name, value] of Object.entries(baseSecurityHeaders(config)))
+      if (!headers.has(name)) headers.set(name, value);
+    if (!headers.has("Content-Security-Policy"))
+      headers.set(
+        "Content-Security-Policy",
+        contentSecurityPolicy(c.req.method, c.req.path, config),
+      );
+    return new Response(body, { status: response.status, headers });
   });
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),

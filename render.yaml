@@ -9,7 +9,9 @@ services:
     # `corepack enable` dies with EROFS. Render's pnpm honors packageManager.
     buildCommand: pnpm install --frozen-lockfile && pnpm build:server
     startCommand: pnpm start
-    healthCheckPath: /api/health
+    # Readiness (not liveness): gates traffic on the database actually answering,
+    # so a deploy whose Postgres is unreachable never receives requests.
+    healthCheckPath: /api/ready
     disk:
       name: openmuse-data
       mountPath: /var/data

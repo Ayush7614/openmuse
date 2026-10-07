@@ -70,6 +70,16 @@ function connectionAddress(c: Context): string | undefined {
   }
 }
 
+/** Per-client bucket key for routes with their own limiter (e.g. sign-in). */
+export function resolveRequestKey(c: Context, trustProxy: boolean): string {
+  return resolveClientKey({
+    trustProxy,
+    forwardedFor: c.req.header("x-forwarded-for"),
+    realIp: c.req.header("x-real-ip"),
+    connectionAddress: connectionAddress(c),
+  });
+}
+
 export function rateLimit(
   trustProxy: boolean,
   options: RateLimitStoreOptions & { getAddress?: (c: Context) => string | undefined } = {},
