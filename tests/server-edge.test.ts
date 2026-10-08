@@ -12,6 +12,8 @@ import {
   baseSecurityHeaders,
   contentSecurityPolicy,
   frameAncestorSources,
+  isSignedRoute,
+  permissionsPolicy,
 } from "../apps/server/src/security-headers.ts";
 import { createSamplePdf } from "../packages/integrations/src/pdf.ts";
 
@@ -88,6 +90,14 @@ test("signed file bytes allow first-party framing but no content directives", as
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "application/pdf");
   assert.equal(response.headers.get("content-security-policy"), framing);
+  // The iframe PDF viewer needs fullscreen; JSON responses keep it denied.
+  assert.equal(
+    response.headers.get("permissions-policy")?.includes("fullscreen"),
+    false,
+    "file downloads must not deny fullscreen",
+  );
+  const json = await app.request("/api/health", { headers: headers() });
+  assert.ok(json.headers.get("permissions-policy")?.includes("fullscreen=()"));
 });
 
 test("readiness reports the database instead of a static ok", async () => {
@@ -103,6 +113,33 @@ test("readiness fails closed when the database is unreachable", async (t) => {
   const response = await app.request("/api/ready");
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), { ok: false, mode: "sample", database: "down" });
+});
+
+test("readiness times out instead of queueing behind a slow query", async (t) => {
+  t.mock.method(db, "ping", () => new Promise<void>(() => {}));
+  const started = Date.now();
+  const response = await app.request("/api/ready");
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { ok: false, mode: "sample", database: "down" });
+  assert.ok(Date.now() - started < 5000, "the probe must be bounded");
+});
+
+test("health and readiness stay outside the shared rate budget", async () => {
+  let probeDb: Store | undefined;
+  let probeDirectory = "";
+  try {
+    probeDirectory = await mkdtemp(join(tmpdir(), "openmuse-server-edge-probe-"));
+    probeDb = await createStore();
+    const probeConfig: Config = { ...config, dataDir: probeDirectory };
+    const { app: probe } = await createApp(probeDb, probeConfig);
+    for (let i = 0; i < 130; i += 1) await probe.request("/api/workspace");
+    assert.equal((await probe.request("/api/workspace")).status, 429);
+    assert.equal((await probe.request("/api/health")).status, 200);
+    assert.equal((await probe.request("/api/ready")).status, 200);
+  } finally {
+    await probeDb?.close();
+    if (probeDirectory) await rm(probeDirectory, { recursive: true, force: true });
+  }
 });
 
 test("sign-in attempts are budgeted per client instead of globally", async () => {
@@ -134,9 +171,42 @@ test("sign-in attempts are budgeted per client instead of globally", async () =>
     // A different address is unaffected: the old global limiter would have
     // locked this client out too.
     assert.equal((await signIn("198.51.100.9")).status, 401);
+    // Spoofed leftmost entries share the proxy-appended hop, so no new bucket.
+    for (let attempt = 0; attempt < 10; attempt += 1)
+      assert.equal((await signIn(`10.9.9.${attempt}, 198.51.100.77`)).status, 401);
+    assert.equal((await signIn("198.51.100.77")).status, 429);
   } finally {
     await liveDb?.close();
     if (liveDirectory) await rm(liveDirectory, { recursive: true, force: true });
+  }
+});
+
+test("sign-in keeps a generous overall cap across distinct clients", async () => {
+  let capDb: Store | undefined;
+  let capDirectory = "";
+  try {
+    capDirectory = await mkdtemp(join(tmpdir(), "openmuse-server-edge-cap-"));
+    capDb = await createStore();
+    const capConfig: Config = {
+      ...config,
+      mode: "live",
+      agentBackend: "model",
+      dataDir: capDirectory,
+      accessKey: "a".repeat(24),
+      trustProxy: true,
+    };
+    const { app: capped } = await createApp(capDb, capConfig);
+    const signIn = (ip: string) =>
+      capped.request("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
+        body: "{}",
+      });
+    for (let i = 0; i < 100; i += 1) assert.equal((await signIn(`198.51.100.${i}`)).status, 401);
+    assert.equal((await signIn("203.0.113.99")).status, 429);
+  } finally {
+    await capDb?.close();
+    if (capDirectory) await rm(capDirectory, { recursive: true, force: true });
   }
 });
 
@@ -211,4 +281,18 @@ test("resolveRequestKey honors proxy headers only when trusted", () => {
     }) as unknown as Context;
   assert.ok(resolveRequestKey(context("203.0.113.7"), true).includes("203.0.113.7"));
   assert.equal(resolveRequestKey(context("203.0.113.7"), false).includes("203.0.113.7"), false);
+});
+
+test("signed routes share one list between auth and headers", () => {
+  assert.equal(isSignedRoute("/api/files/abc/content"), true);
+  assert.equal(isSignedRoute("/api/browsers/abc/preview"), true);
+  assert.equal(isSignedRoute("/api/browsers/abc/console"), true);
+  assert.equal(isSignedRoute("/api/workspace"), false);
+  assert.equal(isSignedRoute("/api/files/abc/fill"), false);
+});
+
+test("permissionsPolicy keeps fullscreen for file downloads only", () => {
+  assert.equal(permissionsPolicy("GET", "/api/files/abc/content").includes("fullscreen"), false);
+  assert.ok(permissionsPolicy("GET", "/api/workspace").includes("fullscreen=()"));
+  assert.ok(permissionsPolicy("GET", "/api/browsers/abc/preview").includes("fullscreen=()"));
 });

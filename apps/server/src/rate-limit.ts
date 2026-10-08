@@ -31,7 +31,15 @@ export function createRateLimitStore(options: RateLimitStoreOptions = {}) {
     if (!entry) {
       if (entries.size >= maxEntries) {
         cleanupExpired(now);
-        if (entries.size >= maxEntries) return false;
+        if (entries.size >= maxEntries) {
+          // Evict the oldest entry instead of locking new keys out: the map
+          // preserves insertion order, so the first key is the stalest bucket.
+          // Failing closed here would reintroduce the lockout a per-client
+          // limiter is meant to prevent (one crowded window blocks newcomers).
+          const oldest = entries.keys().next();
+          if (!oldest.done) entries.delete(oldest.value);
+          else return false;
+        }
       }
       entry = { count: 0, expiresAt: now + windowMs };
       entries.set(key, entry);
@@ -45,6 +53,8 @@ export function createRateLimitStore(options: RateLimitStoreOptions = {}) {
 
 // This limiter runs before authentication, so the key must never be derived from
 // caller-supplied credentials (e.g. Authorization): any string would mint a new bucket.
+// When trusted, the client address is the hop our own proxy appended (the last
+// entry in X-Forwarded-For), not the leftmost entry, which any caller can spoof.
 export function resolveClientKey(input: {
   trustProxy: boolean;
   forwardedFor?: string;
@@ -52,8 +62,12 @@ export function resolveClientKey(input: {
   connectionAddress?: string;
 }): string {
   if (input.trustProxy) {
-    const forwarded = input.forwardedFor?.split(",")[0]?.trim();
-    if (forwarded) return `proxy:${forwarded}`;
+    const hops = input.forwardedFor
+      ?.split(",")
+      .map((hop) => hop.trim())
+      .filter(Boolean);
+    const lastHop = hops?.length ? hops[hops.length - 1] : undefined;
+    if (lastHop) return `proxy:${lastHop}`;
     if (input.realIp) return `proxy:${input.realIp}`;
   }
   return `conn:${input.connectionAddress ?? "unknown"}`;
@@ -71,12 +85,16 @@ function connectionAddress(c: Context): string | undefined {
 }
 
 /** Per-client bucket key for routes with their own limiter (e.g. sign-in). */
-export function resolveRequestKey(c: Context, trustProxy: boolean): string {
+export function resolveRequestKey(
+  c: Context,
+  trustProxy: boolean,
+  getAddress: (c: Context) => string | undefined = connectionAddress,
+): string {
   return resolveClientKey({
     trustProxy,
     forwardedFor: c.req.header("x-forwarded-for"),
     realIp: c.req.header("x-real-ip"),
-    connectionAddress: connectionAddress(c),
+    connectionAddress: getAddress(c),
   });
 }
 
@@ -87,12 +105,13 @@ export function rateLimit(
   const store = createRateLimitStore(options);
   const getAddress = options.getAddress ?? connectionAddress;
   return async (c: Context, next: () => Promise<void>) => {
-    const key = resolveClientKey({
-      trustProxy,
-      forwardedFor: c.req.header("x-forwarded-for"),
-      realIp: c.req.header("x-real-ip"),
-      connectionAddress: getAddress(c),
-    });
+    // Health probes must never consume the shared budget: load-balancer checks
+    // would otherwise be turned away on a busy minute and mark the server down.
+    if (c.req.path === "/api/health" || c.req.path === "/api/ready") {
+      await next();
+      return;
+    }
+    const key = resolveRequestKey(c, trustProxy, getAddress);
     if (!store.take(key, Date.now()))
       throw new AppError("Too many requests. Try again in a minute.", 429);
     await next();

@@ -25,7 +25,12 @@ import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { createRateLimitStore, rateLimit, resolveRequestKey } from "./rate-limit.ts";
-import { baseSecurityHeaders, contentSecurityPolicy, securityHeaders } from "./security-headers.ts";
+import {
+  baseSecurityHeaders,
+  contentSecurityPolicy,
+  isSignedRoute,
+  securityHeaders,
+} from "./security-headers.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -76,6 +81,39 @@ export async function createApp(
       onError: (c) => c.json({ error: "Request is too large; PDFs must be 10 MB or smaller" }, 413),
     }),
   );
+  // Health probes stay outside the shared budget so load-balancer checks are
+  // never turned away on a busy minute (rateLimit() also bypasses them, but
+  // registering them first makes the exemption explicit).
+  app.get("/api/health", (c) =>
+    c.json({
+      ok: true,
+      mode: config.mode,
+      agentConfigured: agentConfigured(config),
+      browserConfigured: Boolean(config.workerUrl && config.workerToken),
+    }),
+  );
+  app.get("/api/ready", async (c) => {
+    // Load balancers cannot authenticate, so readiness stays open like health.
+    // With the default embedded PGlite store this only proves the process is
+    // alive; with DATABASE_URL set it proves Postgres actually answers.
+    // PGlite runs one query at a time, so bound the probe: a slow query
+    // elsewhere must not make Render restart a healthy server.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>(
+      (_, reject) => (timer = setTimeout(() => reject(new Error("readiness timeout")), 1500)),
+    );
+    // Attach a noop handler up front so the rejection is never unhandled when
+    // the probe wins the race and the timer fires later (cleared below anyway).
+    timeout.catch(() => {});
+    try {
+      await Promise.race([db.ping(), timeout]);
+      return c.json({ ok: true, mode: config.mode, database: "up" });
+    } catch {
+      return c.json({ ok: false, mode: config.mode, database: "down" }, 503);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  });
   app.use("/api/*", rateLimit(Boolean(config.trustProxy)));
   app.onError((error, c) => {
     if (error instanceof z.ZodError)
@@ -96,36 +134,30 @@ export async function createApp(
       502,
     );
   });
-  app.get("/api/health", (c) =>
-    c.json({
-      ok: true,
-      mode: config.mode,
-      agentConfigured: agentConfigured(config),
-      browserConfigured: Boolean(config.workerUrl && config.workerToken),
-    }),
-  );
-  app.get("/api/ready", async (c) => {
-    // Load balancers cannot authenticate, so readiness stays open like health —
-    // but unlike health it actually probes the store, so a pod whose database
-    // is unreachable stops receiving traffic instead of serving 500s.
-    try {
-      await db.ping();
-      return c.json({ ok: true, mode: config.mode, database: "up" });
-    } catch {
-      return c.json({ ok: false, mode: config.mode, database: "down" }, 503);
-    }
-  });
   // Sign-in attempts are cheap for an attacker (one JSON body) and expensive to
-  // get wrong, so each client gets its own small bucket. The previous limiter
-  // was a single process-global 30/minute counter shared by every address,
-  // which meant one hostile client could lock every legitimate user out.
-  const signInAttempts = createRateLimitStore({
+  // get wrong, so each client gets its own small bucket (10/min), backed by a
+  // generous overall cap (100/min) so a flood of distinct spoofed addresses
+  // cannot exhaust the server. Per-client keys depend on TRUST_PROXY: behind a
+  // proxy without it, every user shares one bucket, so deploy with
+  // TRUST_PROXY=true (see render.yaml / .env.example).
+  const signInPerClient = createRateLimitStore({
     windowMs: 60_000,
     maxRequests: 10,
     maxEntries: 5_000,
   });
+  const signInOverall = createRateLimitStore({
+    windowMs: 60_000,
+    maxRequests: 100,
+    maxEntries: 2,
+  });
   app.post("/api/session", async (c) => {
-    if (!signInAttempts.take(resolveRequestKey(c, Boolean(config.trustProxy)), Date.now()))
+    const now = Date.now();
+    const clientAllowed = signInPerClient.take(
+      resolveRequestKey(c, Boolean(config.trustProxy)),
+      now,
+    );
+    const overallAllowed = signInOverall.take("global", now);
+    if (!clientAllowed || !overallAllowed)
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
     const session = await auth.session(body.accessKey);
@@ -146,10 +178,9 @@ export async function createApp(
     );
   });
   app.use("/api/*", async (c, next) => {
-    const signedRoute =
-      /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
-        c.req.path,
-      );
+    // Shared with security-headers.ts so a new signed route cannot get the
+    // strictest CSP by forgetting one of the two lists.
+    const signedRoute = isSignedRoute(c.req.path);
     const owner =
       signedRoute && c.req.query("signature")
         ? auth.verify(new URL(c.req.url))
@@ -361,7 +392,9 @@ export async function createApp(
     // A returned Response bypasses context headers, so apply the edge policy
     // explicitly instead of inheriting whatever the runtime happened to set.
     const headers = new Headers(response.headers);
-    for (const [name, value] of Object.entries(baseSecurityHeaders(config)))
+    for (const [name, value] of Object.entries(
+      baseSecurityHeaders(config, c.req.method, c.req.path),
+    ))
       if (!headers.has(name)) headers.set(name, value);
     if (!headers.has("Content-Security-Policy"))
       headers.set(
