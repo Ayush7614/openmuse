@@ -101,20 +101,11 @@ export function permissionsPolicy(method: string, path: string): string {
 }
 
 /** Headers that are identical on every response. */
-export function baseSecurityHeaders(
-  config: Config,
-  method?: string,
-  path?: string,
-): Record<string, string> {
+export function baseSecurityHeaders(config: Config): Record<string, string> {
   const headers: Record<string, string> = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
-    // The API serves data, never media capture: deny the powerful features outright.
-    "Permissions-Policy":
-      method !== undefined && path !== undefined
-        ? permissionsPolicy(method, path)
-        : defaultPermissionsPolicy,
   };
   // Browsers ignore HSTS on plaintext, and emitting it there would be a lie in
   // local/sample setups, so only advertise it when the public URL is https.
@@ -128,32 +119,49 @@ export function baseSecurityHeaders(
 }
 
 /**
- * Sets hardening headers on every response, including error responses produced
- * by `onError`. Handlers that return a raw `Response` (the CopilotKit stream
- * passthrough) bypass context headers and must apply these explicitly.
+ * Single builder for both response paths. The framing directive only depends
+ * on config, so it (and every policy derived from it) is built once at
+ * startup instead of on every request.
  *
- * The framing directive only depends on config, so it (and every policy derived
- * from it) is built once at startup instead of on every request.
+ * Handlers that return a raw `Response` (the CopilotKit stream passthrough)
+ * bypass context headers, so they use `headersFor()` to apply the exact same
+ * policy the middleware sets.
  */
-export function securityHeaders(config: Config) {
+export function createEdgeHeaders(config: Config) {
   const framing = frameAncestorsDirective(config);
   const strictCsp = `default-src 'none'; base-uri 'none'; form-action 'none'; ${framing}`;
   const consoleCsp = `${consoleContentPolicyBase}; ${framing}`;
   const byteCsp = framing;
   const base = baseSecurityHeaders(config);
-  const policyFor = (method: string, path: string): string => {
+
+  const cspFor = (method: string, path: string): string => {
     if (isConsolePage(method, path)) return consoleCsp;
     if (isByteRoute(method, path)) return byteCsp;
     return strictCsp;
   };
-  return async (c: Context, next: () => Promise<void>) => {
-    const method = c.req.method;
-    const path = c.req.path;
-    for (const [name, value] of Object.entries(base)) {
-      if (name === "Permissions-Policy") c.header(name, permissionsPolicy(method, path));
-      else c.header(name, value);
-    }
-    c.header("Content-Security-Policy", policyFor(method, path));
+
+  const headersFor = (method: string, path: string): Record<string, string> => ({
+    ...base,
+    // The API serves data, never media capture: deny the powerful features outright.
+    "Permissions-Policy": permissionsPolicy(method, path),
+    "Content-Security-Policy": cspFor(method, path),
+  });
+
+  const middleware = async (c: Context, next: () => Promise<void>) => {
+    for (const [name, value] of Object.entries(headersFor(c.req.method, c.req.path)))
+      c.header(name, value);
     await next();
   };
+
+  return { base, cspFor, headersFor, middleware };
+}
+
+/**
+ * Sets hardening headers on every response, including error responses produced
+ * by `onError`. Handlers that return a raw `Response` (the CopilotKit stream
+ * passthrough) bypass context headers and must apply these explicitly via
+ * `createEdgeHeaders(config).headersFor()`.
+ */
+export function securityHeaders(config: Config) {
+  return createEdgeHeaders(config).middleware;
 }

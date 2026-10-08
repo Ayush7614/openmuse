@@ -151,7 +151,7 @@ test("spoofed bearer tokens from one connection share a single bucket", async ()
   assert.equal(other.status, 200);
 });
 
-test("capacity exhaustion fails closed and recovers once entries expire", async () => {
+test("capacity exhaustion evicts the oldest entry instead of locking out", async () => {
   const addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"];
   let current = 0;
   const app = limitedApp({ maxEntries: 3, windowMs: 60_000, getAddress: () => addresses[current] });
@@ -166,6 +166,31 @@ test("capacity exhaustion fails closed and recovers once entries expire", async 
   );
   current = 1;
   assert.equal((await app.request("/api/ping")).status, 200, "existing entries keep working");
+});
+
+test("an evicted entry restarts with a fresh budget", () => {
+  const store = createRateLimitStore({ windowMs: 60_000, maxRequests: 1, maxEntries: 2 });
+  assert.equal(store.take("a", 0), true);
+  assert.equal(store.take("b", 0), true);
+  // At capacity "c" evicts "a" (least recently used).
+  assert.equal(store.take("c", 1), true);
+  // The dropped key gets a fresh bucket rather than inheriting its old count.
+  assert.equal(store.take("a", 2), true, "evicted key restarts at count 1");
+  assert.equal(store.take("a", 3), false, "but the fresh bucket still enforces its limit");
+});
+
+test("recently active entries survive eviction over idle ones", () => {
+  const store = createRateLimitStore({ windowMs: 60_000, maxRequests: 2, maxEntries: 3 });
+  assert.equal(store.take("a", 0), true);
+  assert.equal(store.take("a", 1), true, "a is now at its limit (count 2)");
+  assert.equal(store.take("b", 2), true);
+  assert.equal(store.take("c", 3), true);
+  // Touch "b" so recency order is a, c, b; the next newcomer must evict "a".
+  assert.equal(store.take("b", 4), true, "b reaches its limit (count 2)");
+  assert.equal(store.take("d", 5), true, "newcomer evicts least-recently-active entry");
+  // "a" was evicted and restarts fresh; "b" kept its exhausted count.
+  assert.equal(store.take("a", 6), true, "evicted entry restarts fresh");
+  assert.equal(store.take("b", 6), false, "recently active entry keeps its count");
 });
 
 test("capacity exhaustion reclaims expired entries", () => {

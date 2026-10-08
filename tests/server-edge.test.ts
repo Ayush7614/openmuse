@@ -124,6 +124,38 @@ test("readiness times out instead of queueing behind a slow query", async (t) =>
   assert.ok(Date.now() - started < 5000, "the probe must be bounded");
 });
 
+test("concurrent readiness checks share one in-flight probe", async (t) => {
+  // Fresh app: the timeout test above leaves the shared app's coalesced probe
+  // pending forever (its mocked ping never resolves), so isolation matters here.
+  let sharedDb: Store | undefined;
+  let sharedDirectory = "";
+  try {
+    sharedDirectory = await mkdtemp(join(tmpdir(), "openmuse-server-edge-shared-"));
+    sharedDb = await createStore();
+    const sharedConfig: Config = { ...config, dataDir: sharedDirectory };
+    const { app: shared } = await createApp(sharedDb, sharedConfig);
+    let calls = 0;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.mock.method(sharedDb, "ping", async () => {
+      calls += 1;
+      await gate;
+    });
+    const first = shared.request("/api/ready");
+    const second = shared.request("/api/ready");
+    setTimeout(() => release?.(), 50);
+    const [r1, r2] = await Promise.all([first, second]);
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(calls, 1, "concurrent checks must not queue extra database queries");
+  } finally {
+    await sharedDb?.close();
+    if (sharedDirectory) await rm(sharedDirectory, { recursive: true, force: true });
+  }
+});
+
 test("health and readiness stay outside the shared rate budget", async () => {
   let probeDb: Store | undefined;
   let probeDirectory = "";
@@ -181,7 +213,7 @@ test("sign-in attempts are budgeted per client instead of globally", async () =>
   }
 });
 
-test("sign-in keeps a generous overall cap across distinct clients", async () => {
+test("sign-in flood monitor warns instead of locking everyone out", async () => {
   let capDb: Store | undefined;
   let capDirectory = "";
   try {
@@ -202,8 +234,14 @@ test("sign-in keeps a generous overall cap across distinct clients", async () =>
         headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
         body: "{}",
       });
+    // A hard overall cap would let a few addresses lock everyone else out, so
+    // the flood monitor only logs: 101 distinct clients all still get through
+    // to auth (401), and per-client budgets still block repeat offenders.
     for (let i = 0; i < 100; i += 1) assert.equal((await signIn(`198.51.100.${i}`)).status, 401);
-    assert.equal((await signIn("203.0.113.99")).status, 429);
+    assert.equal((await signIn("203.0.113.99")).status, 401);
+    for (let attempt = 0; attempt < 10; attempt += 1)
+      assert.equal((await signIn("203.0.113.7")).status, 401);
+    assert.equal((await signIn("203.0.113.7")).status, 429);
   } finally {
     await capDb?.close();
     if (capDirectory) await rm(capDirectory, { recursive: true, force: true });

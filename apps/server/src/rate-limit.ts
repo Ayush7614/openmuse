@@ -26,25 +26,38 @@ export function createRateLimitStore(options: RateLimitStoreOptions = {}) {
   }
 
   function take(key: string, now: number): boolean {
-    let entry = entries.get(key);
-    if (entry && entry.expiresAt <= now) entry = undefined;
-    if (!entry) {
-      if (entries.size >= maxEntries) {
-        cleanupExpired(now);
-        if (entries.size >= maxEntries) {
-          // Evict the oldest entry instead of locking new keys out: the map
-          // preserves insertion order, so the first key is the stalest bucket.
-          // Failing closed here would reintroduce the lockout a per-client
-          // limiter is meant to prevent (one crowded window blocks newcomers).
-          const oldest = entries.keys().next();
-          if (!oldest.done) entries.delete(oldest.value);
-          else return false;
-        }
-      }
-      entry = { count: 0, expiresAt: now + windowMs };
-      entries.set(key, entry);
+    const existing = entries.get(key);
+    if (existing && existing.expiresAt > now) {
+      // Active hit: refresh recency so eviction drops the
+      // least-recently-active bucket, not merely the earliest-inserted one.
+      existing.count += 1;
+      entries.delete(key);
+      entries.set(key, existing);
+      return existing.count <= maxRequests;
     }
-    entry.count += 1;
+    // New key or expired renewal. Renewals must move to the back: Map.set() on
+    // an existing key keeps its original (front) position, so an actively
+    // signing-in client would otherwise be evicted before long-gone entries.
+    const hadExpired = existing !== undefined;
+    if (hadExpired) {
+      entries.delete(key);
+      // The window turned over for this key, so peers likely expired too:
+      // reclaim them now instead of leaving stale buckets behind.
+      cleanupExpired(now);
+    }
+    if (entries.size >= maxEntries) {
+      cleanupExpired(now);
+      if (entries.size >= maxEntries) {
+        // Evict the least-recently-used entry instead of locking new keys out.
+        // Failing closed here would reintroduce the lockout a per-client
+        // limiter is meant to prevent (one crowded window blocks newcomers).
+        const oldest = entries.keys().next();
+        if (!oldest.done) entries.delete(oldest.value);
+        else return false;
+      }
+    }
+    const entry = { count: 1, expiresAt: now + windowMs };
+    entries.set(key, entry);
     return entry.count <= maxRequests;
   }
 
@@ -105,12 +118,8 @@ export function rateLimit(
   const store = createRateLimitStore(options);
   const getAddress = options.getAddress ?? connectionAddress;
   return async (c: Context, next: () => Promise<void>) => {
-    // Health probes must never consume the shared budget: load-balancer checks
-    // would otherwise be turned away on a busy minute and mark the server down.
-    if (c.req.path === "/api/health" || c.req.path === "/api/ready") {
-      await next();
-      return;
-    }
+    // Health/readiness exemption lives in app.ts registration order (probes are
+    // registered before this middleware), so this limiter stays route-agnostic.
     const key = resolveRequestKey(c, trustProxy, getAddress);
     if (!store.take(key, Date.now()))
       throw new AppError("Too many requests. Try again in a minute.", 429);

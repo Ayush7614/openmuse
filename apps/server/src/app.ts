@@ -25,12 +25,7 @@ import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { createRateLimitStore, rateLimit, resolveRequestKey } from "./rate-limit.ts";
-import {
-  baseSecurityHeaders,
-  contentSecurityPolicy,
-  isSignedRoute,
-  securityHeaders,
-} from "./security-headers.ts";
+import { createEdgeHeaders, isSignedRoute } from "./security-headers.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -57,9 +52,13 @@ export async function createApp(
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
+  // One prebuilt policy for both response paths: the middleware below and the
+  // CopilotKit raw-Response passthrough share headersFor(), so a change to one
+  // cannot silently miss the other.
+  const edgeHeaders = createEdgeHeaders(config);
   // Hardening first so rejected requests (origin gate, rate limits, validation)
   // carry the same headers as successful ones.
-  app.use("*", securityHeaders(config));
+  app.use("*", edgeHeaders.middleware);
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
     if (origin && !origins.has(origin)) return c.json({ error: "Origin is not allowed" }, 403);
@@ -82,8 +81,8 @@ export async function createApp(
     }),
   );
   // Health probes stay outside the shared budget so load-balancer checks are
-  // never turned away on a busy minute (rateLimit() also bypasses them, but
-  // registering them first makes the exemption explicit).
+  // never turned away on a busy minute: they are registered before the
+  // `/api/*` limiter, which is the single exemption mechanism.
   app.get("/api/health", (c) =>
     c.json({
       ok: true,
@@ -92,6 +91,11 @@ export async function createApp(
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
     }),
   );
+  // Coalesced probe: PGlite runs one query at a time, so concurrent Render
+  // checks share a single in-flight ping instead of queueing behind each other
+  // and making recovery slower. The per-request timeout still bounds the HTTP
+  // response; the shared ping keeps waiting once and is reused, never piled up.
+  let readyInFlight: Promise<void> | null = null;
   app.get("/api/ready", async (c) => {
     // Load balancers cannot authenticate, so readiness stays open like health.
     // With the default embedded PGlite store this only proves the process is
@@ -106,7 +110,16 @@ export async function createApp(
     // the probe wins the race and the timer fires later (cleared below anyway).
     timeout.catch(() => {});
     try {
-      await Promise.race([db.ping(), timeout]);
+      if (!readyInFlight) {
+        readyInFlight = db.ping().finally(() => {
+          readyInFlight = null;
+        });
+      }
+      const probe = readyInFlight;
+      // A late timer rejection after the probe wins must not surface as an
+      // unhandled rejection on the shared promise.
+      probe.catch(() => {});
+      await Promise.race([probe, timeout]);
       return c.json({ ok: true, mode: config.mode, database: "up" });
     } catch {
       return c.json({ ok: false, mode: config.mode, database: "down" }, 503);
@@ -135,30 +148,29 @@ export async function createApp(
     );
   });
   // Sign-in attempts are cheap for an attacker (one JSON body) and expensive to
-  // get wrong, so each client gets its own small bucket (10/min), backed by a
-  // generous overall cap (100/min) so a flood of distinct spoofed addresses
-  // cannot exhaust the server. Per-client keys depend on TRUST_PROXY: behind a
-  // proxy without it, every user shares one bucket, so deploy with
-  // TRUST_PROXY=true (see render.yaml / .env.example).
+  // get wrong, so each client gets its own small bucket (10/min). A hard
+  // overall cap would pull against that goal — one address burning through it
+  // would lock everyone else out — so the flood monitor below only logs a
+  // warning instead of blocking. It counts only attempts that pass the
+  // per-client check, so already-rejected floods cannot consume it. Per-client
+  // keys depend on TRUST_PROXY: behind a proxy without it, every user shares
+  // one bucket, so deploy with TRUST_PROXY=true (see render.yaml / .env.example).
   const signInPerClient = createRateLimitStore({
     windowMs: 60_000,
     maxRequests: 10,
     maxEntries: 5_000,
   });
-  const signInOverall = createRateLimitStore({
+  const signInFlood = createRateLimitStore({
     windowMs: 60_000,
     maxRequests: 100,
     maxEntries: 2,
   });
   app.post("/api/session", async (c) => {
     const now = Date.now();
-    const clientAllowed = signInPerClient.take(
-      resolveRequestKey(c, Boolean(config.trustProxy)),
-      now,
-    );
-    const overallAllowed = signInOverall.take("global", now);
-    if (!clientAllowed || !overallAllowed)
+    if (!signInPerClient.take(resolveRequestKey(c, Boolean(config.trustProxy)), now))
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
+    if (!signInFlood.take("global", now))
+      console.warn("[OpenMuse] sign-in flood: over 100 attempts in a minute");
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
     const session = await auth.session(body.accessKey);
     await workspace.ensureSample("local-user", actions);
@@ -389,18 +401,12 @@ export async function createApp(
         },
       }),
     );
-    // A returned Response bypasses context headers, so apply the edge policy
-    // explicitly instead of inheriting whatever the runtime happened to set.
+    // A returned Response bypasses context headers, so apply the same edge
+    // policy the middleware sets instead of inheriting whatever the runtime
+    // happened to set.
     const headers = new Headers(response.headers);
-    for (const [name, value] of Object.entries(
-      baseSecurityHeaders(config, c.req.method, c.req.path),
-    ))
+    for (const [name, value] of Object.entries(edgeHeaders.headersFor(c.req.method, c.req.path)))
       if (!headers.has(name)) headers.set(name, value);
-    if (!headers.has("Content-Security-Policy"))
-      headers.set(
-        "Content-Security-Policy",
-        contentSecurityPolicy(c.req.method, c.req.path, config),
-      );
     return new Response(body, { status: response.status, headers });
   });
   app.get("/", (c) =>
